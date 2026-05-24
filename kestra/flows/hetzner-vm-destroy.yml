@@ -1,0 +1,112 @@
+id: hetzner-vm-destroy
+namespace: demo
+
+inputs:
+  - id: vm_name
+    type: STRING
+    displayName: "VM Name"
+    description: "Name der zu löschenden VM – muss exakt mit dem Namen beim Provisionieren übereinstimmen."
+
+tasks:
+  # ── Destroy ───────────────────────────────────────────────────────────────
+  - id: terraform-destroy
+    type: io.kestra.plugin.terraform.cli.TerraformCLI
+    containerImage: hashicorp/terraform:latest
+    env:
+      AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+      AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+      TF_BACKEND_BUCKET: "{{ secret('TF_BACKEND_BUCKET') }}"
+      TF_BACKEND_ENDPOINT: "{{ secret('TF_BACKEND_ENDPOINT') }}"
+      TF_VAR_hcloud_token: "{{ secret('HCLOUD_TOKEN') }}"
+      TF_VAR_ssh_key_name: "{{ secret('SSH_KEY_NAME') }}"
+    inputFiles:
+      # Identische Konfiguration wie beim Provisionieren –
+      # Terraform liest den tatsächlichen Zustand aus dem S3-State
+      main.tf: |
+        terraform {
+          required_version = ">= 1.5"
+          required_providers {
+            hcloud = {
+              source  = "hetznercloud/hcloud"
+              version = "~> 1.49"
+            }
+          }
+          backend "s3" {}
+        }
+
+        provider "hcloud" {
+          token = var.hcloud_token
+        }
+
+        data "hcloud_ssh_key" "default" {
+          name = var.ssh_key_name
+        }
+
+        resource "hcloud_server" "vm" {
+          name        = var.vm_name
+          image       = "ubuntu-24.04"
+          server_type = var.server_type
+          location    = var.location
+          ssh_keys    = [data.hcloud_ssh_key.default.id]
+
+          public_net {
+            ipv4_enabled = true
+            ipv6_enabled = false
+          }
+
+          labels = {
+            managed_by = "terraform"
+            team       = var.team
+          }
+        }
+
+        output "vm_ipv4" {
+          value = hcloud_server.vm.ipv4_address
+        }
+
+      variables.tf: |
+        variable "hcloud_token" {
+          type      = string
+          sensitive = true
+        }
+        variable "ssh_key_name" {
+          type = string
+        }
+        variable "vm_name" {
+          type = string
+        }
+        variable "server_type" {
+          type    = string
+          default = "cx23"
+        }
+        variable "location" {
+          type    = string
+          default = "nbg1"
+        }
+        variable "team" {
+          type    = string
+          default = "demo"
+        }
+
+    beforeCommands:
+      - |
+        terraform init -reconfigure \
+          -backend-config="bucket=$TF_BACKEND_BUCKET" \
+          -backend-config="endpoints={s3=\"$TF_BACKEND_ENDPOINT\"}" \
+          -backend-config="key=vms/{{ inputs.vm_name }}/terraform.tfstate" \
+          -backend-config="region=eu-central" \
+          -backend-config="skip_requesting_account_id=true" \
+          -backend-config="skip_credentials_validation=true" \
+          -backend-config="skip_metadata_api_check=true" \
+          -backend-config="skip_region_validation=true" \
+          -backend-config="use_path_style=true"
+
+    commands:
+      - |
+        terraform destroy -auto-approve -no-color \
+          -var="vm_name={{ inputs.vm_name }}"
+
+  # ── Bestätigung ───────────────────────────────────────────────────────────
+  - id: log-result
+    type: io.kestra.plugin.core.log.Log
+    message: "🗑️ VM '{{ inputs.vm_name }}' wurde erfolgreich gelöscht."
