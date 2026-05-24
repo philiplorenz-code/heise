@@ -1,0 +1,231 @@
+id: hetzner-vm-provision
+namespace: demo
+
+inputs:
+  - id: vm_name
+    type: STRING
+    displayName: "VM Name"
+    description: "Eindeutiger Name der VM (z.B. dev-server-01). Wird als Terraform-State-Key verwendet."
+
+  - id: server_type
+    type: SELECT
+    displayName: "Server-Typ"
+    description: "cx23 = 2 vCPU 4 GB ~4 €/Mon | cx33 = 4 vCPU 8 GB ~9 €/Mon | cpx42 = 8 vCPU 16 GB ~30 €/Mon"
+    values:
+      - cx23
+      - cx33
+      - cpx42
+    defaults: cx23
+
+  - id: location
+    type: SELECT
+    displayName: "Standort"
+    description: "Hetzner-Datacenter"
+    values:
+      - nbg1
+      - fsn1
+      - hel1
+    defaults: nbg1
+
+  - id: team
+    type: STRING
+    displayName: "Team"
+    description: "Wird als Label auf der VM gesetzt"
+    defaults: demo
+
+tasks:
+  # ── 1. Terraform Plan ─────────────────────────────────────────────────────
+  - id: terraform-plan
+    type: io.kestra.plugin.terraform.cli.TerraformCLI
+    containerImage: hashicorp/terraform:latest
+    env:
+      AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+      AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+      TF_BACKEND_BUCKET: "{{ secret('TF_BACKEND_BUCKET') }}"
+      TF_BACKEND_ENDPOINT: "{{ secret('TF_BACKEND_ENDPOINT') }}"
+      TF_VAR_hcloud_token: "{{ secret('HCLOUD_TOKEN') }}"
+      TF_VAR_ssh_key_name: "{{ secret('SSH_KEY_NAME') }}"
+    inputFiles:
+      main.tf: |
+        terraform {
+          required_version = ">= 1.5"
+          required_providers {
+            hcloud = {
+              source  = "hetznercloud/hcloud"
+              version = "~> 1.49"
+            }
+          }
+          backend "s3" {}
+        }
+
+        provider "hcloud" {
+          token = var.hcloud_token
+        }
+
+        data "hcloud_ssh_key" "default" {
+          name = var.ssh_key_name
+        }
+
+        resource "hcloud_server" "vm" {
+          name        = var.vm_name
+          image       = "ubuntu-24.04"
+          server_type = var.server_type
+          location    = var.location
+          ssh_keys    = [data.hcloud_ssh_key.default.id]
+
+          public_net {
+            ipv4_enabled = true
+            ipv6_enabled = false
+          }
+
+          labels = {
+            managed_by = "terraform"
+            team       = var.team
+          }
+        }
+
+        output "vm_ipv4" {
+          value = hcloud_server.vm.ipv4_address
+        }
+
+      variables.tf: |
+        variable "hcloud_token" {
+          type      = string
+          sensitive = true
+        }
+        variable "ssh_key_name" {
+          type = string
+        }
+        variable "vm_name" {
+          type = string
+        }
+        variable "server_type" {
+          type    = string
+          default = "cx23"
+        }
+        variable "location" {
+          type    = string
+          default = "nbg1"
+        }
+        variable "team" {
+          type    = string
+          default = "demo"
+        }
+
+    beforeCommands:
+      - |
+        terraform init -reconfigure \
+          -backend-config="bucket=$TF_BACKEND_BUCKET" \
+          -backend-config="endpoints={s3=\"$TF_BACKEND_ENDPOINT\"}" \
+          -backend-config="key=vms/{{ inputs.vm_name }}/terraform.tfstate" \
+          -backend-config="region=eu-central" \
+          -backend-config="skip_requesting_account_id=true" \
+          -backend-config="skip_credentials_validation=true" \
+          -backend-config="skip_metadata_api_check=true" \
+          -backend-config="skip_region_validation=true" \
+          -backend-config="use_path_style=true"
+
+    commands:
+      - |
+        set -eo pipefail
+        terraform plan -no-color -out=tfplan \
+          -var="vm_name={{ inputs.vm_name }}" \
+          -var="server_type={{ inputs.server_type }}" \
+          -var="location={{ inputs.location }}" \
+          -var="team={{ inputs.team }}" \
+          | tee plan-output.txt
+
+    outputFiles:
+      - tfplan
+      - main.tf
+      - variables.tf
+      - plan-output.txt
+
+  # ── 2. LLM-Summary ────────────────────────────────────────────────────────
+  - id: llm-summary
+    type: io.kestra.plugin.openai.ChatCompletion
+    apiKey: "{{ secret('OPENAI_API_KEY') }}"
+    model: gpt-4o-mini
+    messages:
+      - role: system
+        content: "Du bist ein DevOps-Assistent. Fasse den folgenden Terraform Plan auf Deutsch in 3-5 Sätzen zusammen. Erkläre was erstellt oder geändert wird und ob der Plan sicher aussieht."
+      - role: user
+        content: "{{ read(outputs['terraform-plan'].outputFiles['plan-output.txt']) }}"
+
+  # ── 3. Summary loggen (sichtbar für den Approver) ─────────────────────────
+  - id: log-summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      📋 KI-Analyse des Terraform Plans:
+
+      {{ outputs['llm-summary'].choices[0].message.content }}
+
+      ──────────────────────────────────────────
+      → Bitte prüfen und Execution fortsetzen (Resume) oder ablehnen.
+
+  # ── 4. Approval Gate ──────────────────────────────────────────────────────
+  - id: approval-gate
+    type: io.kestra.plugin.core.flow.Pause
+    onResume:
+      - id: approved
+        type: BOOLEAN
+        displayName: "Deployment genehmigen?"
+        description: "Ja = VM wird erstellt. Nein = Execution wird abgebrochen."
+        defaults: false
+
+  # ── 5. Deploy oder Abbruch ────────────────────────────────────────────────
+  - id: deploy-decision
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs['approval-gate'].onResume.approved == true }}"
+
+    then:
+      # ── 5a. Apply ──────────────────────────────────────────────────────────
+      - id: terraform-apply
+        type: io.kestra.plugin.terraform.cli.TerraformCLI
+        containerImage: hashicorp/terraform:latest
+        env:
+          AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+          AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+          TF_BACKEND_BUCKET: "{{ secret('TF_BACKEND_BUCKET') }}"
+          TF_BACKEND_ENDPOINT: "{{ secret('TF_BACKEND_ENDPOINT') }}"
+          TF_VAR_hcloud_token: "{{ secret('HCLOUD_TOKEN') }}"
+          TF_VAR_ssh_key_name: "{{ secret('SSH_KEY_NAME') }}"
+        inputFiles:
+          main.tf: "{{ outputs['terraform-plan'].outputFiles['main.tf'] }}"
+          variables.tf: "{{ outputs['terraform-plan'].outputFiles['variables.tf'] }}"
+          tfplan: "{{ outputs['terraform-plan'].outputFiles['tfplan'] }}"
+        beforeCommands:
+          - |
+            terraform init -reconfigure \
+              -backend-config="bucket=$TF_BACKEND_BUCKET" \
+              -backend-config="endpoints={s3=\"$TF_BACKEND_ENDPOINT\"}" \
+              -backend-config="key=vms/{{ inputs.vm_name }}/terraform.tfstate" \
+              -backend-config="region=eu-central" \
+              -backend-config="skip_requesting_account_id=true" \
+              -backend-config="skip_credentials_validation=true" \
+              -backend-config="skip_metadata_api_check=true" \
+              -backend-config="skip_region_validation=true" \
+              -backend-config="use_path_style=true"
+        commands:
+          - terraform apply -auto-approve -no-color tfplan
+          - terraform output -raw vm_ipv4 | tr -d '\n' > vm_ipv4.txt
+        outputFiles:
+          - vm_ipv4.txt
+
+      # ── 5b. Ergebnis loggen ────────────────────────────────────────────────
+      - id: log-result
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          ✅ VM erfolgreich bereitgestellt!
+
+          Name:   {{ inputs.vm_name }}
+          Typ:    {{ inputs.server_type }} @ {{ inputs.location }}
+          Team:   {{ inputs.team }}
+          IPv4:   {{ read(outputs['terraform-apply'].outputFiles['vm_ipv4.txt']) }}
+
+          SSH:    ssh root@{{ read(outputs['terraform-apply'].outputFiles['vm_ipv4.txt']) }}
+
+    else:
+      - id: log-aborted
+        type: io.kestra.plugin.core.log.Log
+        message: "❌ Deployment abgebrochen – Approval wurde verweigert."
